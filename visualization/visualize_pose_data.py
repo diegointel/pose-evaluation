@@ -13,7 +13,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 import camera  # Your camera transformations module, required by get_camera_mesh
 
-def get_camera_mesh(pose_4x4, depth=1):
+def get_camera_mesh(pose_4x4, depth=0.2):
     # shape: pose_4x4 = [N,4,4]
     # reduce to [N,3,4] by removing the last row
     pose_3x4 = pose_4x4[..., :3, :]  # keep only rows 0..2
@@ -67,9 +67,22 @@ def merge_centers(two_centers):
         center_merged[2] += [float(cc1[2]), float(cc2[2]), None]
     return center_merged
 
+def get_look_at_points_2_world(pose, s = 5):
+    R = pose[..., :3, :3]
+    t = pose[..., :3, 3]
+    R_transposed = R.transpose(1, 2)
+    forward_directions = R_transposed[:, :, 2]
+
+    # Compute camera origins in world space
+    camera_origins = -torch.bmm(R_transposed, t.unsqueeze(-1)).squeeze(-1)
+
+    # Compute the point each camera is looking at
+    look_at_points = camera_origins + s * forward_directions
+    return look_at_points
+
 
 @torch.no_grad()
-def vis_cameras(opt, vis, step, poses=[], colors=["blue", "magenta"], plot_dist=True):
+def vis_cameras(opt, vis, step, ids=[], poses=[], colors=["blue", "magenta"], plot_dist=True):
     """
     Visualize multiple sets of poses in 3D using Visdom.
     Each element in 'poses' is a PyTorch tensor of shape [N, 4, 4].
@@ -77,10 +90,26 @@ def vis_cameras(opt, vis, step, poses=[], colors=["blue", "magenta"], plot_dist=
     win_name = "{}/{}".format(opt.group, opt.name)
     data = []
     centers = []
-    for pose, color in zip(poses, colors):
+    for pose, color, set_text in zip(poses, colors, ["GT","M"]):
+        id = [id_txt + " " + set_text for id_txt in ids]
         pose = pose.detach().cpu()
         vertices, faces, wireframe = get_camera_mesh(pose, depth=opt.visdom.cam_depth)
+
+        look_at_point = get_look_at_points_2_world(pose, 1.2)
         center = vertices[:, -1]
+
+        merged_look_at = merge_centers([center, look_at_point])
+
+        data.append(dict(
+            type="scatter3d",
+            x=merged_look_at[0],
+            y=merged_look_at[1],
+            z=merged_look_at[2],
+            mode="lines",
+            line=dict(color=color, width=4),
+            opacity=0.15,
+        ))
+
         centers.append(center)
         # Camera centers
         data.append(dict(
@@ -90,8 +119,12 @@ def vis_cameras(opt, vis, step, poses=[], colors=["blue", "magenta"], plot_dist=
             z=[float(n) for n in center[:, 2]],
             mode="markers",
             marker=dict(color=color, size=3),
+            text=id,
         ))
+
+
         # Camera mesh
+        '''
         vertices_merged, faces_merged = merge_meshes(vertices, faces)
         data.append(dict(
             type="mesh3d",
@@ -116,6 +149,7 @@ def vis_cameras(opt, vis, step, poses=[], colors=["blue", "magenta"], plot_dist=
             line=dict(color=color),
             opacity=0.3,
         ))
+        '''
     # Optionally plot distance lines between pose 0 and 1, etc.
     if plot_dist and len(centers) >= 2:
         center_merged = merge_centers(centers[:2])
@@ -125,7 +159,8 @@ def vis_cameras(opt, vis, step, poses=[], colors=["blue", "magenta"], plot_dist=
             y=center_merged[1],
             z=center_merged[2],
             mode="lines",
-            line=dict(color="red", width=4),
+            line=dict(color="red", width=2, dash="dash"),
+            opacity=0.5,
         ))
     # Send data to Visdom
     vis._send(dict(
@@ -162,17 +197,20 @@ def load_comparison_csv(csv_path):
     Return two lists of 4x4 numpy arrays: (gt_poses, other_poses).
     """
     df = pd.read_csv(csv_path)
+    ids = []
     gt_poses = []
     other_poses = []
     for _, row in df.iterrows():
+        id = str(row['Image ID'])
         gt_pose = parse_pose_string(str(row['Ground Truth Pose']))
         other_pose = parse_pose_string(str(row['Other Pose']))
+        ids.append(id)
         gt_poses.append(gt_pose)
         other_poses.append(other_pose)
     # Convert to torch tensors for visualization
     gt_poses = torch.from_numpy(np.stack(gt_poses, axis=0)).float()
     other_poses = torch.from_numpy(np.stack(other_poses, axis=0)).float()
-    return gt_poses, other_poses
+    return ids, gt_poses, other_poses
 
 def visualize_folder(folder, vis, opt):
     """
@@ -194,14 +232,41 @@ def visualize_folder(folder, vis, opt):
             continue
 
         # Load data
-        gt_poses, method_poses = load_comparison_csv(csv_path)
+        ids, gt_poses, method_poses = load_comparison_csv(csv_path)
         # Visualize
         opt.group = folder
         opt.name = method_name
         print(f"Visualizing {method_name} for folder {folder} with {len(gt_poses)} pairs of poses...")
-        vis_cameras(opt, vis, step=0, poses=[gt_poses, method_poses],
+        vis_cameras(opt, vis, step=0, ids = ids, poses=[gt_poses, method_poses],
                     colors=["green", "magenta"], plot_dist=True)
 
+def visualize_blender(folder, vis, opt):
+    """
+    For a given folder, load the three CSV files (if present):
+        - colmap_comparison.csv
+        - colmap_free3dgs_comparison.csv
+        - gaussian_object_comparison.csv
+    and visualize them in Visdom.
+    """
+    output_folder = f"pose_data_comparation/{folder}"
+
+    csv_files = ["blender_comparison_current.csv", "blender_comparison_raw.csv", "blender_comparison.csv"]
+    method_names = ["Blender_Current", "Blender_Raw", "Blender"]
+
+    for csv_file, method_name in zip(csv_files, method_names):
+        csv_path = os.path.join(output_folder, csv_file)
+        if not os.path.exists(csv_path):
+            print(f"[WARNING] File {csv_path} does not exist. Skipping.")
+            continue
+
+        # Load data
+        ids, gt_poses, method_poses = load_comparison_csv(csv_path)
+        # Visualize
+        opt.group = folder
+        opt.name = method_name
+        print(f"Visualizing {method_name} for folder {folder} with {len(gt_poses)} pairs of poses...")
+        vis_cameras(opt, vis, step=0, ids=ids, poses=[gt_poses, method_poses],
+                    colors=["green", "magenta"], plot_dist=True)
 
 def visualize_test_folder(folder, vis, opt):
     output_folder = f"pose_data_comparation/{folder}"
@@ -215,12 +280,12 @@ def visualize_test_folder(folder, vis, opt):
             continue
 
         # Load data
-        gt_poses, method_poses = load_comparison_csv(csv_path)
+        ids, gt_poses, method_poses = load_comparison_csv(csv_path)
         # Visualize
         opt.group = folder
         opt.name = method_name
         print(f"Visualizing {method_name} for folder {folder} with {len(gt_poses)} pairs of poses...")
-        vis_cameras(opt, vis, step=0, poses=[gt_poses, method_poses],
+        vis_cameras(opt, vis, step=0, ids=ids, poses=[gt_poses, method_poses],
                     colors=["green", "magenta"], plot_dist=True)
 
 
@@ -297,7 +362,7 @@ def visualize_normalization_folder(folder, vis, opt):
         return
 
     # Load ground truth poses
-    gt_poses, _ = load_comparison_csv(csv_path)
+    ids, gt_poses, _ = load_comparison_csv(csv_path)
     gt_poses_dict = {f"Camera {i}": pose.numpy() for i, pose in enumerate(gt_poses)}
 
     # Normalize poses and get intermediate steps
@@ -309,18 +374,18 @@ def visualize_normalization_folder(folder, vis, opt):
         step_poses = torch.tensor(np.stack(list(step_info["poses"].values())))
         opt.name = f"{folder}_{step_name}"
         print(f"Visualizing {step_name} for folder {folder}...")
-        vis_cameras(opt, vis, step=0, poses=[step_poses], colors=["blue"], plot_dist=False)
+        vis_cameras(opt, vis, step=0, ids=ids, poses=[step_poses], colors=["blue"], plot_dist=False)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--folders", nargs="+", default=["AP13","MDF14","ShSu12","SMu1"],
-                        help="List of folders to visualize (default: AP13 MDF14 ShSu12 SMu1)")
+                        help="List of folders to visualize (default: AP13 MDF14 ShSu12 SMu1 Blender)")
     parser.add_argument("--visdom_server", type=str, default="http://localhost",
                         help="Visdom server URL (default: http://localhost)")
     parser.add_argument("--visdom_port", type=int, default=8097,
                         help="Visdom server port (default: 8097)")
-    parser.add_argument("--cam_depth", type=float, default=1.0,
+    parser.add_argument("--cam_depth", type=float, default=1,
                         help="Size/depth scale of the camera frustum in the plot.")
     args = parser.parse_args()
 
@@ -339,8 +404,9 @@ def main():
 
     for folder in args.folders:
         visualize_folder(folder, vis, opt)
-    visualize_test_folder("test_rotation", vis, opt)
-    visualize_normalization_folder("MDF14", vis, opt)
+    visualize_blender("Blender", vis, opt)
+    #visualize_test_folder("test_rotation", vis, opt)
+    #visualize_normalization_folder("MDF14", vis, opt)
 
 if __name__ == "__main__":
     main()

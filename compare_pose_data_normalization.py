@@ -1,9 +1,84 @@
 import os
 import csv
+import copy
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+
+def rotation_error(pose_error):
+    """Compute rotation error
+    Args:
+        pose_error (4x4 array): relative pose error
+    Returns:
+        rot_error (float): rotation error
+    """
+    a = pose_error[0, 0]
+    b = pose_error[1, 1]
+    c = pose_error[2, 2]
+    d = 0.5 * (a + b + c - 1.0)
+    rot_error = np.arccos(max(min(d, 1.0), -1.0))
+    return rot_error
+
+
+def translation_error(pose_error):
+    """Compute translation error
+    Args:
+        pose_error (4x4 array): relative pose error
+    Returns:
+        trans_error (float): translation error
+    """
+    dx = pose_error[0, 3]
+    dy = pose_error[1, 3]
+    dz = pose_error[2, 3]
+    trans_error = np.sqrt(dx**2 + dy**2 + dz**2)
+    return trans_error
+
+
+def compute_rpe(view_matrices, ref_gt, get_raw_errors=False):
+    trans_errors = []
+    rot_errors = []
+
+    list_vm = list(view_matrices.values())
+    list_gt = list(ref_gt.values())
+
+    for i in range(len(list_gt) - 1):
+        gt1 = list_gt[i]
+        gt2 = list_gt[i + 1]
+        gt_rel = np.linalg.inv(gt1) @ gt2
+
+        pred1 = list_vm[i]
+        pred2 = list_vm[i + 1]
+        pred_rel = np.linalg.inv(pred1) @ pred2
+        rel_err = np.linalg.inv(gt_rel) @ pred_rel
+
+        trans_errors.append(translation_error(rel_err))
+        rot_errors.append(rotation_error(rel_err))
+
+    if get_raw_errors:
+        return trans_errors, rot_errors
+
+    rpe_trans = np.mean(np.asarray(trans_errors))
+    rpe_rot = np.mean(np.asarray(rot_errors))
+    return rpe_trans, rpe_rot
+
+
+def compute_ATE(view_matrices, ref_gt):
+    """Compute RMSE of ATE
+    Args:
+        gt: ground-truth poses
+        pred: predicted poses
+    """
+    errors = []
+    for key in view_matrices.keys():
+        _, pred_xyz = get_Rt_2_world(view_matrices[key])
+        _, gt_xyz = get_Rt_2_world(ref_gt[key])
+
+        align_err = gt_xyz - pred_xyz
+        errors.append(np.sqrt(np.sum(align_err**2)))
+
+    ate = np.sqrt(np.mean(np.asarray(errors) ** 2))
+    return ate
 
 
 def load_camera_poses(file_path, id_column, pose_column, image_id_format, multi_column=False):
@@ -44,327 +119,150 @@ def load_camera_poses(file_path, id_column, pose_column, image_id_format, multi_
             camera_poses[image_id] = pose.reshape(4, 4) if len(pose) == 16 else convert_to_4x4(pose)
     return camera_poses
 
+def get_Rt_2_world(view_matrix):
+    R = view_matrix[:3, :3]
+    t_c = view_matrix[:3, 3]
+    t = -R.T @ t_c
+    return R, t
 
+def take_Rts_2_world(view_matrices):
+    R_set = {}
+    t_set = {}
 
-def convert_to_4x4(pose):
-    """
-    Convert a flat pose array into a 4x4 transformation matrix.
+    # Take Rtp
+    for (key, val) in view_matrices.items():
+        R, t = get_Rt_2_world(val)
+        R_set[key] = R
+        t_set[key] = t
 
-    Args:
-        pose (np.ndarray): Flat pose array.
+    return R_set, t_set
 
-    Returns:
-        np.ndarray: 4x4 transformation matrix.
-    """
-    normalized_pose = np.eye(4)
-    normalized_pose[:3, :3] = pose[:9].reshape(3, 3)
-    normalized_pose[:3, 3] = pose[9:12]
-    return normalized_pose
+def move_centroid_to_origin(view_matrices):
 
+    # Take positions
+    _, t_set = take_Rts_2_world(view_matrices)
 
-# def normalize_camera_poses(camera_poses):
-#     """
-#     Normalize camera poses: move camera 0 to the origin, scale distances,
-#     and align directions for consistency.
+    # Calculate centroid
+    average_vector = np.average(list(t_set.values()), axis=0)
 
-#     Args:
-#         camera_poses (dict): Dictionary of camera poses.
+    # Move to origin
+    for val in t_set.values():
+        val -= average_vector
 
-#     Returns:
-#         dict: Dictionary of normalized camera poses.
-#     """
-#     if not camera_poses:
-#         return {}
+    # Save new translations
+    for key in view_matrices.keys():
+        view_matrices[key][:3, 3] = -view_matrices[key][:3, :3] @ t_set[key]
 
-#     # Select reference camera (camera 0)
-#     reference_image_id = next(iter(camera_poses))
-#     reference_pose = camera_poses[reference_image_id]
+def normalize_p_to_unit_sphere(view_matrices):
+    s = 1
 
-#     # Extract rotation and translation of camera 0
-#     R_ref = reference_pose[:3, :3]
-#     t_ref = reference_pose[:3, 3]
+    # Take positions
+    R_set, t_set = take_Rts_2_world(view_matrices)
 
-#     # Force reference rotation to identity
-#     T_ref = np.eye(4)
-#     T_ref[:3, :3] = np.eye(3)
-#     T_ref[:3, 3] = [0, 0, 0]
+    # Compute norms of camera positions
+    norms = [np.linalg.norm(pos) for pos in t_set.values()]
 
-#     # Identify a second camera to calculate scale
-#     second_image_id = None
-#     for image_id in camera_poses:
-#         if image_id != reference_image_id:
-#             second_image_id = image_id
-#             break
+    # Find maximum norm
+    max_norm = max(norms)
 
-#     if not second_image_id:
-#         return {reference_image_id: T_ref}
+    if (max_norm < 0.98 * s) or (max_norm > 1.01*s):
+        for key in view_matrices.keys():
+            new_p = (t_set[key]/max_norm)*s
+            view_matrices[key][:3, 3] = (-R_set[key] @ new_p)
 
-#     # Calculate scale based on distance between camera 0 and camera 1
-#     ref_translation = reference_pose[:3, 3]
-#     second_translation = camera_poses[second_image_id][:3, 3]
-#     original_distance = np.linalg.norm(second_translation - ref_translation)
+def normalize_rotation(view_matrices):
+    for key in view_matrices.keys():
+        # Extract rotation matrix (upper-left 3x3 block)
+        R, _ = get_Rt_2_world(view_matrices[key])
 
-#     scale_factor = 1.0 / (original_distance if original_distance != 0 else 1)
+        # Normalize the rotation matrix using SVD
+        U, _, Vt = np.linalg.svd(R)
+        R_normalized = np.dot(U, Vt)
 
-#     # Normalize all cameras
-#     normalized_poses = {}
-#     for image_id, pose in camera_poses.items():
-#         # R_relative = np.dot(np.linalg.inv(R_ref), pose[:3, :3])  # Relative rotation to camera 0
-#         R_relative = pose[:3, :3]
-#         t_relative = scale_factor * (pose[:3, 3] - t_ref)        # Relative translation (scaled)
+        # Ensure determinant is +1 (if det(R_normalized) = -1, correct it)
+        if np.linalg.det(R_normalized) < 0:
+            R_normalized *= -1
 
-#         T_normalized = np.eye(4)
-#         T_normalized[:3, :3] = R_relative
-#         T_normalized[:3, 3] = t_relative
-#         normalized_poses[image_id] = T_normalized
+        # Reassemble the normalized rotation matrix
+        view_matrices[key][:3, :3] = R_normalized
 
-#     # Ensure camera 0 is at the origin with identity rotation
-#     # normalized_poses[reference_image_id] = T_ref
+def scale_method_to_gt(view_matrices, ref_gt):
 
-#     return normalized_poses
+    # Take positions
+    R_set, t_set_vm = take_Rts_2_world(view_matrices)
+    _, t_set_gt = take_Rts_2_world(ref_gt)
 
+    # Compute norms of camera positions
+    norms_vm = [np.linalg.norm(pos) for pos in t_set_vm.values()]
+    norms_gt = [np.linalg.norm(pos) for pos in t_set_gt.values()]
 
-def normalize_camera_poses(camera_poses):
-    """
-    Normalize camera poses: move camera 0 to the origin, scale distances,
-    and align directions for consistency.
+    # Find average norm
+    ave_norm_vm = np.average(norms_vm)
+    ave_norm_gt = np.average(norms_gt)
 
-    Args:
-        camera_poses (dict): Dictionary of camera poses.
-
-    Returns:
-        dict: Dictionary of normalized camera poses.
-    """
-    if not camera_poses:
-        return {}
-
-    # Select reference camera (camera 0)
-    reference_image_id = next(iter(camera_poses))
-    reference_pose = camera_poses[reference_image_id]
-
-    # Extract rotation (R) and translation (t) of reference camera
-    R_ref = reference_pose[:3, :3]
-    t_ref = reference_pose[:3, 3]
-
-    # Ensure the reference camera is at the origin with identity rotation
-    T_ref = np.eye(4)
-
-    # Calculate scale using all cameras
-    distances = []
-    ref_translation = t_ref
-    for image_id, pose in camera_poses.items():
-        if image_id != reference_image_id:
-            second_translation = pose[:3, 3]
-            distance = np.linalg.norm(second_translation - ref_translation)
-            distances.append(distance)
-    avg_distance = np.mean(distances) if distances else 1.0
-    scale_factor = 1.0 / avg_distance
-
-    # Normalize all cameras
-    normalized_poses = {}
-    for image_id, pose in camera_poses.items():
-        R_current = pose[:3, :3]
-        t_current = pose[:3, 3]
-
-        # Compute relative rotation and translation
-        R_relative = np.dot(np.linalg.inv(R_ref), R_current)
-        t_relative = scale_factor * (t_current - t_ref)
-
-        # Construct normalized pose
-        T_normalized = np.eye(4)
-        T_normalized[:3, :3] = R_relative
-        T_normalized[:3, 3] = t_relative
-        normalized_poses[image_id] = T_normalized
-
-    # Explicitly set the reference camera to identity pose
-    normalized_poses[reference_image_id] = T_ref
-
-    return normalized_poses
-
-
-
-def filter_and_normalize_poses(method_poses, ground_truth_poses):
-    """
-    Filter images used by the method, pair with GroundTruth, and normalize.
-
-    Args:
-        method_poses (dict): Poses from a specific method.
-        ground_truth_poses (dict): GroundTruth poses.
-
-    Returns:
-        dict: Normalized poses from the method.
-        dict: Corresponding normalized GroundTruth poses.
-    """
-    common_ids = set(method_poses.keys()) & set(ground_truth_poses.keys())
-    method_filtered = {image_id: method_poses[image_id] for image_id in common_ids}
-    ground_truth_filtered = {image_id: ground_truth_poses[image_id] for image_id in common_ids}
-    method_normalized = normalize_camera_poses(method_filtered)
-    ground_truth_normalized = normalize_camera_poses(ground_truth_filtered)
-    return method_normalized, ground_truth_normalized
-
-
-def extract_centers_from_poses(camera_poses):
-    """
-    From a dict {id -> 4x4 pose}, return:
-    - centers: Nx3 array of translation centers,
-    - ids: list of pose IDs in the same order,
-    - poses_4x4: list of the original 4x4 matrices.
-    """
-    ids = list(camera_poses.keys())
-    centers = []
-    poses_4x4 = []
-    for img_id in ids:
-        pose = camera_poses[img_id]
-        center = pose[:3, 3]  # translation is the last column of the top 3 rows
-        centers.append(center)
-        poses_4x4.append(pose)
-    centers = np.vstack(centers)  # shape (N,3)
-    return centers, ids, poses_4x4
-
-def procrustes_align_3D(src_points, tgt_points, do_scale=True):
-    """
-    Align src_points -> tgt_points in 3D using an SVD-based Procrustes method.
-    If do_scale=False, we preserve the original scale (s=1).
-
-    Args:
-        src_points (ndarray): (N,3) source points
-        tgt_points (ndarray): (N,3) target points
-        do_scale (bool): If True, find a global scale s. If False, keep s=1.
-
-    Returns:
-        R (3x3), s (float), t (3,): rotation, scale, translation
-    """
-    # 1) Compute the centroids
-    src_centroid = src_points.mean(axis=0)
-    tgt_centroid = tgt_points.mean(axis=0)
-    src_centered = src_points - src_centroid
-    tgt_centered = tgt_points - tgt_centroid
-
-    # 2) If do_scale=True, normalize each set by its RMS distance
-    if do_scale:
-        src_norm = np.sqrt((src_centered**2).sum())
-        tgt_norm = np.sqrt((tgt_centered**2).sum())
-        # Avoid division by zero
-        if src_norm < 1e-9 or tgt_norm < 1e-9:
-            # fallback to no scale
-            src_norm, tgt_norm = 1.0, 1.0
-        src_centered /= src_norm
-        tgt_centered /= tgt_norm
-
-    # 3) Compute rotation via SVD
-    H = src_centered.T @ tgt_centered  # (3xN)(N×3) = 3×3
-    U, _, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
-    # Fix reflection if det(R) < 0
-    if np.linalg.det(R) < 0:
-        Vt[-1, :] *= -1
-        R = Vt.T @ U.T
-
-    # 4) Compute scale
-    if do_scale:
-        # ratio of the sums of squares
-        src_ssq = (src_centered**2).sum()
-        tgt_ssq = (tgt_centered**2).sum()
-        s = np.sqrt(tgt_ssq / (src_ssq + 1e-9))
+    # Compute the scale factor
+    if ave_norm_vm != 0:
+        scale_factor = ave_norm_gt / ave_norm_vm
+        for key in view_matrices.keys():
+            view_matrices[key][:3, 3] = -R_set[key] @ (t_set_vm[key] * scale_factor)
     else:
-        s = 1.0
+        print("\t\tNot able to scale. Div by zero.")
 
-    # 5) Compute translation
-    #   aligned_src = s*R*(src - src_centroid) + t = tgt
-    # => t = tgt_centroid - s*R*src_centroid
-    t = tgt_centroid - s * (R @ src_centroid)
+def align_method_to_gt(view_matrices, ref_gt):
 
-    return R, s, t
+    # Extract rotation components
+    rotations_vm_d, _ = take_Rts_2_world(view_matrices)
+    rotations_gt_d, _ = take_Rts_2_world(ref_gt)
 
+    rotations_vm = list(rotations_vm_d.values())
+    rotations_gt = list(rotations_gt_d.values())
 
-def apply_rigid_transform_4x4(pose_4x4, R, s, t):
-    """
-    Apply the transformation (R, s, t) to a 4x4 camera pose matrix.
-    pose_4x4 = [R0 | t0]
-               [0 0 0 1 ]
-    """
-    # Decompose the original pose
-    R0 = pose_4x4[:3, :3]
-    t0 = pose_4x4[:3, 3]
+    # Centroids just in case
+    centroid_vm = np.mean(rotations_vm, axis=0)
+    centroid_gt = np.mean(rotations_gt, axis=0)
 
-    # Compose new rotation, translation
-    R_new = R @ R0
-    t_new = s * (R @ t0) + t
+    # Compute cross-covariance matrix
+    H = np.zeros((3, 3))
+    for R_vm, R_gt in zip(rotations_vm, rotations_gt):
+        H += np.dot((R_vm - centroid_vm).T, (R_gt - centroid_gt))
 
-    # Build a new 4x4
-    pose_new = np.eye(4)
-    pose_new[:3, :3] = R_new
-    pose_new[:3, 3] = t_new
-    return pose_new
+    # Perform SVD
+    U, _, Vt = np.linalg.svd(H)
+    R_optimal = np.dot(Vt.T, U.T)
 
-def align_camera_poses_procrustes(ref_poses, tgt_poses, do_scale=True):
-    """
-    Align tgt_poses to ref_poses (both dicts: {id -> 4x4}).
-    Returns aligned_tgt_poses (dict).
-    """
-    # 1) Find the common IDs (to match)
-    common_ids = set(ref_poses.keys()).intersection(set(tgt_poses.keys()))
-    if len(common_ids) < 2:
-        print("[Warning] <2 common IDs, can't do Procrustes. Returning original.")
-        return dict(tgt_poses)  # no alignment
+    # Ensure proper rotation (determinant check)
+    if np.linalg.det(R_optimal) < 0:
+        Vt[-1, :] *= -1
+        R_optimal = np.dot(Vt.T, U.T)
 
-    # 2) Extract centers for these common IDs, build arrays
-    ref_centers, ref_order = [], []
-    tgt_centers, tgt_order = [], []
-    for cid in sorted(common_ids):
-        ref_centers.append(ref_poses[cid][:3, 3])
-        tgt_centers.append(tgt_poses[cid][:3, 3])
-        ref_order.append(cid)
-        tgt_order.append(cid)
-    ref_centers = np.vstack(ref_centers)  # (M,3)
-    tgt_centers = np.vstack(tgt_centers)  # (M,3)
+    # Align method views
+    for key in view_matrices.keys():
+        # Extract rotation and translation from view matrices
+        R_cs, t_s = get_Rt_2_world(view_matrices[key])
+        R_ws = R_cs.T
+        R_ws_aligned = R_optimal @ R_ws
 
-    # 3) Compute transform that aligns tgt->ref
-    R, s, t = procrustes_align_3D(tgt_centers, ref_centers, do_scale=do_scale)
+        view_matrices[key][:3, :3] = R_ws_aligned.T  # Transpose back for view matrix
 
-    # 4) Apply (R,s,t) to *all* tgt_poses (not just the common ones)
-    aligned = {}
-    for cid, pose_4x4 in tgt_poses.items():
-        aligned[cid] = apply_rigid_transform_4x4(pose_4x4, R, s, t)
+def scale_align_method_poses(method_poses, ground_truth_poses = None):
 
-    return aligned
+    normalize_rotation(method_poses)
+    normalize_p_to_unit_sphere(method_poses)
+    move_centroid_to_origin(method_poses)
 
-def filter_and_align_poses(method_poses, ground_truth_poses, do_scale=True):
-    """
-    Filter out only the common IDs, then align method_poses to ground_truth_poses
-    via Procrustes (R, s, t). Return (aligned_method_poses, filtered_ground_truth).
+    if ground_truth_poses:
 
-    Args:
-        method_poses (dict): Dictionary of method poses.
-        ground_truth_poses (dict): Dictionary of ground truth poses.
-        do_scale (bool): Whether to apply scaling during alignment.
+        normalize_rotation(ground_truth_poses)
+        normalize_p_to_unit_sphere(ground_truth_poses)
+        move_centroid_to_origin(ground_truth_poses)
 
-    Returns:
-        dict: Aligned poses from the method.
-        dict: Filtered ground truth poses.
-    """
-    # Find common IDs
-    common_ids = set(method_poses.keys()) & set(ground_truth_poses.keys())
-    if not common_ids:
-        return {}, {}
+        # Align to GT
+        scale_method_to_gt(method_poses, ground_truth_poses)
+        align_method_to_gt(method_poses, ground_truth_poses)
 
-    # Filter each dictionary
-    method_filtered = {img_id: method_poses[img_id] for img_id in common_ids}
-    gt_filtered = {img_id: ground_truth_poses[img_id] for img_id in common_ids}
-
-    # Normalize both sets of poses
-    method_normalized = normalize_camera_poses(method_filtered)
-    gt_normalized = normalize_camera_poses(gt_filtered)
-
-    # Align the normalized poses
-    aligned_method_poses = align_camera_poses_procrustes(
-        gt_normalized, method_normalized, do_scale=do_scale
-    )
-
-    return aligned_method_poses, gt_normalized
-
-
-
+        ATE = compute_ATE(method_poses, ground_truth_poses)
+        rpe_trans, rpe_rot = compute_rpe(method_poses, ground_truth_poses)
+        print(f"\t\tPose eval metrics ATE = {ATE}, RPE_trans = {rpe_trans}, RPE_rot = {rpe_rot}")
 
 def compare_camera_poses(ground_truth_poses, other_poses):
     """
@@ -404,7 +302,63 @@ def normalize_image_id(image_id):
     return image_id.zfill(4) if image_id.isdigit() else os.path.splitext(image_id)[0]
 
 
+def convert_translations(view_matrices):
+    for key, M_wc in view_matrices.items():
+        # Extract the rotation matrix and translation vector
+        R = M_wc[:3, :3]  # Rotation matrix
+        t = M_wc[:3, 3]
+
+        M_wc[:3, 3] = -R.T @ t
+
+
+def transpose_rotations(view_matrices):
+    for key, M_wc in view_matrices.items():
+        # Extract the rotation matrix and translation vector
+        R = M_wc[:3, :3]  # Rotation matrix
+
+        # Transpose the rotation matrix
+        M_wc[:3, :3] = R.T
+
+# Function to invert matrices
+def invert_matrices(dictionary):
+    for key, matrix in dictionary.items():
+        # Calculate the inverse
+        dictionary[key] = np.linalg.inv(matrix)
+
+def fix_camera_orientation(dictionary):
+
+    # Define a 180-degree rotation around the X-axis
+    flip_x = np.array([
+        [1, 0, 0, 0],
+        [0, -1, 0, 0],
+        [0, 0, -1, 0],
+        [0, 0, 0, 1],
+    ])
+
+    for key, matrix in dictionary.items():
+        # Apply the flip to the world-to-camera matrix
+        dictionary[key] = flip_x @ matrix
+
 def main():
+
+    # Blender
+    ground_truth_path_blender = f'data/poses_output/Blender/blender_poses.csv'
+    blender_path = f'data/ALGO_poses_result/Blender/blender_poses.csv'
+    outputFolder_blender = f'visualization/pose_data_comparation/Blender/'
+    os.makedirs(outputFolder_blender, exist_ok=True)
+    ground_truth_poses_blender = load_camera_poses(ground_truth_path_blender, 'Image ID', 'Camera Pose',
+                                                   normalize_image_id)
+    blender_poses = load_camera_poses(blender_path, 'Image ID', 'Camera Pose', normalize_image_id)
+
+    fix_camera_orientation(blender_poses)
+    fix_camera_orientation(ground_truth_poses_blender)
+
+    ground_truth_poses_blender = {key: ground_truth_poses_blender[key] for key in sorted(ground_truth_poses_blender)}
+    blender_poses = {key: blender_poses[key] for key in sorted(blender_poses)}
+    scale_align_method_poses(blender_poses, ground_truth_poses_blender)
+    blender_comparison = compare_camera_poses(ground_truth_poses_blender, blender_poses)
+    blender_comparison.to_csv(f'{outputFolder_blender}/blender_comparison.csv', index=False)
+
     data_folders = ['AP13', 'MDF14', 'ShSu12', 'SMu1']
     # data_folders = ['test_rotation']
     for folder in data_folders:
@@ -412,47 +366,82 @@ def main():
         colmap_path = f'data/ALGO_poses_result/COLMAP/{folder}/camera_positions.csv'
         colmap_free3dgs_path = f'data/ALGO_poses_result/CF3DGS/HO3Dv3_{folder}/poses_pred.csv'
         gaussian_object_path = f'data/ALGO_poses_result/GAUSSIAN_OBJECT/{folder}/camera_poses.csv'
-        outputFolder = f'pose_data_comparation/{folder}/'
+
+        outputFolder = f'visualization/pose_data_comparation/{folder}/'
         os.makedirs(outputFolder, exist_ok=True)
 
         ground_truth_poses = load_camera_poses(ground_truth_path, 'Image ID', 'Camera Pose', normalize_image_id)
         colmap_poses = load_camera_poses(colmap_path, 'Image Name', 'Camera Pose', normalize_image_id)
         colmap_free3dgs_poses = load_camera_poses(colmap_free3dgs_path, 'Image ID', 'Camera Pose', normalize_image_id, multi_column=True)
+        #invert_matrices(colmap_free3dgs_poses)
+        #transpose_rotations(colmap_free3dgs_poses)
+        #fix_camera_orientation(colmap_free3dgs_poses)
+        #convert_translations(colmap_free3dgs_poses)
         gaussian_object_poses = load_camera_poses(gaussian_object_path, 'Image Name', 'Camera Pose', normalize_image_id)
+        invert_matrices(gaussian_object_poses)
 
-        max_len_set = len(colmap_poses)
-        max_set = colmap_poses
-        if (len(colmap_free3dgs_poses) > max_len_set):
-            max_len_set = len(colmap_free3dgs_poses)
-            max_set = colmap_free3dgs_poses
-        elif (len(gaussian_object_poses) > max_len_set):
-            max_len_set = len(gaussian_object_poses)
-            max_set = gaussian_object_poses
 
-        common_ids = set(max_set.keys()) & set(ground_truth_poses.keys())
-        if not common_ids:
-            return {}, {}
+        common_ids_colmap = set(colmap_poses.keys()) & set(ground_truth_poses.keys())
+        common_ids_cf3dgs = set(colmap_free3dgs_poses.keys()) & set(ground_truth_poses.keys())
+        common_ids_go = set(gaussian_object_poses.keys()) & set(ground_truth_poses.keys())
 
         # Filter each dictionary
-        gt_filtered = {img_id: ground_truth_poses[img_id] for img_id in common_ids}
-        
+        gt_filtered_colmap = {img_id: copy.deepcopy(ground_truth_poses[img_id]) for img_id in common_ids_colmap}
+        gt_filtered_cf3dgs = {img_id: copy.deepcopy(ground_truth_poses[img_id]) for img_id in common_ids_cf3dgs}
+        gt_filtered_go = {img_id: copy.deepcopy(ground_truth_poses[img_id]) for img_id in common_ids_go}
+
+        colmap_poses = {img_id: copy.deepcopy(colmap_poses[img_id]) for img_id in common_ids_colmap}
+        colmap_free3dgs_poses = {img_id: copy.deepcopy(colmap_free3dgs_poses[img_id]) for img_id in common_ids_cf3dgs}
+        gaussian_object_poses = {img_id: copy.deepcopy(gaussian_object_poses[img_id]) for img_id in common_ids_go}
+
+        # Sort
+        gt_filtered_colmap = {key: gt_filtered_colmap[key] for key in sorted(gt_filtered_colmap)}
+        gt_filtered_cf3dgs = {key: gt_filtered_cf3dgs[key] for key in sorted(gt_filtered_cf3dgs)}
+        gt_filtered_go = {key: gt_filtered_go[key] for key in sorted(gt_filtered_go)}
+        colmap_poses = {key: colmap_poses[key] for key in sorted(colmap_poses)}
+        colmap_free3dgs_poses = {key: colmap_free3dgs_poses[key] for key in sorted(colmap_free3dgs_poses)}
+        gaussian_object_poses = {key: gaussian_object_poses[key] for key in sorted(gaussian_object_poses)}
+
+        colmap_poses_ = colmap_poses.copy()
+        colmap_free3dgs_poses_ = colmap_free3dgs_poses.copy()
+        gaussian_object_poses_ = gaussian_object_poses.copy()
+
+        # Invert
+
+        #colmap_poses, colmap_ground_truth = filter_and_align_poses(colmap_poses, ground_truth_poses, do_scale=True)
+        #colmap_free3dgs_poses, colmap_free3dgs_ground_truth = filter_and_align_poses(colmap_free3dgs_poses, ground_truth_poses, do_scale=True)
+        #gaussian_object_poses, gaussian_object_ground_truth = filter_and_align_poses(gaussian_object_poses, ground_truth_poses, do_scale=True)
+        #blender_poses, blender_ground_truth = filter_and_align_poses(blender_poses, ground_truth_poses_blender, do_scale=True)
+
+        print(f'Folder {folder}')
+        print(f'\tFolder colmap_poses')
+        scale_align_method_poses(colmap_poses_)
+        print(f'\tFolder colmap_free3dgs_poses')
+        scale_align_method_poses(colmap_free3dgs_poses_)
+        print(f'\tFolder gaussian_object_poses')
+        scale_align_method_poses(gaussian_object_poses_)
+        print(f'\tFolder ground_truth_poses')
+        scale_align_method_poses(ground_truth_poses)
+        print(f'\tFolder colmap_comp')
+        scale_align_method_poses(colmap_poses, gt_filtered_colmap)
+        print(f'\tFolder colmap_free_comp')
+        scale_align_method_poses(colmap_free3dgs_poses, gt_filtered_cf3dgs)
+        print(f'\tFolder gaussian_object_comp')
+        scale_align_method_poses(gaussian_object_poses, gt_filtered_go)
+
         colmap_ = compare_camera_poses(colmap_poses, colmap_poses)
         colmap_free3dgs_ = compare_camera_poses(colmap_free3dgs_poses, colmap_free3dgs_poses)
         gaussian_object_ = compare_camera_poses(gaussian_object_poses, gaussian_object_poses)
-        ground_truth_ = compare_camera_poses(gt_filtered, gt_filtered)
+        ground_truth_ = compare_camera_poses(ground_truth_poses, ground_truth_poses)
 
-        colmap_poses, colmap_ground_truth = filter_and_align_poses(colmap_poses, ground_truth_poses, do_scale=True)
-        colmap_free3dgs_poses, colmap_free3dgs_ground_truth = filter_and_align_poses(colmap_free3dgs_poses, ground_truth_poses, do_scale=True)
-        gaussian_object_poses, gaussian_object_ground_truth = filter_and_align_poses(gaussian_object_poses, ground_truth_poses, do_scale=True)
+        colmap_comparison = compare_camera_poses(gt_filtered_colmap, colmap_poses)
+        colmap_free3dgs_comparison = compare_camera_poses(gt_filtered_cf3dgs, colmap_free3dgs_poses)
+        gaussian_object_comparison = compare_camera_poses(gt_filtered_go, gaussian_object_poses)
 
-        colmap_comparison = compare_camera_poses(colmap_ground_truth, colmap_poses)
-        colmap_free3dgs_comparison = compare_camera_poses(colmap_free3dgs_ground_truth, colmap_free3dgs_poses)
-        gaussian_object_comparison = compare_camera_poses(gaussian_object_ground_truth, gaussian_object_poses)
-
-    
         colmap_comparison.to_csv(f'{outputFolder}/colmap_comparison.csv', index=False)
         colmap_free3dgs_comparison.to_csv(f'{outputFolder}/colmap_free3dgs_comparison.csv', index=False)
         gaussian_object_comparison.to_csv(f'{outputFolder}/gaussian_object_comparison.csv', index=False)
+
         colmap_.to_csv(f'{outputFolder}/colmap_.csv', index=False)
         colmap_free3dgs_.to_csv(f'{outputFolder}/colmap_free3dgs_.csv', index=False)
         gaussian_object_.to_csv(f'{outputFolder}/gaussian_object_.csv', index=False)
