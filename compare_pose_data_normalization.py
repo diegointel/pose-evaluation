@@ -260,10 +260,6 @@ def scale_align_method_poses(method_poses, ground_truth_poses = None):
         scale_method_to_gt(method_poses, ground_truth_poses)
         align_method_to_gt(method_poses, ground_truth_poses)
 
-        ATE = compute_ATE(method_poses, ground_truth_poses)
-        rpe_trans, rpe_rot = compute_rpe(method_poses, ground_truth_poses)
-        print(f"\t\tPose eval metrics ATE = {ATE}, RPE_trans = {rpe_trans}, RPE_rot = {rpe_rot}")
-
 def compare_camera_poses(ground_truth_poses, other_poses):
     """
     Compare camera poses between GroundTruth and another method.
@@ -286,7 +282,12 @@ def compare_camera_poses(ground_truth_poses, other_poses):
                 'Other Pose': other_pose.flatten(),
                 'Difference': difference
             })
-    return pd.DataFrame(comparison_results)
+
+    ate = compute_ATE(other_poses, ground_truth_poses)
+    rpe_trans, rpe_rot = compute_rpe(other_poses, ground_truth_poses)
+
+    eval_metrics = {"ate": ate, "rpe_trans": rpe_trans, "rpe_rot": rpe_rot}
+    return pd.DataFrame(comparison_results), eval_metrics
 
 
 def normalize_image_id(image_id):
@@ -341,111 +342,66 @@ def fix_camera_orientation(dictionary):
 
 def main():
 
-    # Blender
-    ground_truth_path_blender = f'data/poses_output/Blender/blender_poses.csv'
-    blender_path = f'data/ALGO_poses_result/Blender/blender_poses.csv'
-    outputFolder_blender = f'visualization/pose_data_comparation/Blender/'
-    os.makedirs(outputFolder_blender, exist_ok=True)
-    ground_truth_poses_blender = load_camera_poses(ground_truth_path_blender, 'Image ID', 'Camera Pose',
-                                                   normalize_image_id)
-    blender_poses = load_camera_poses(blender_path, 'Image ID', 'Camera Pose', normalize_image_id)
+    object_folders = ['AP13', 'MDF14', 'ShSu12', 'SMu1']
+    eval_metrics = {}
+    method_poses_files = {'COLMAP' : "data/ALGO_poses_result/{}/{}/camera_positions.csv",
+                          'CF3DGS' : "data/ALGO_poses_result/{}/HO3Dv3_{}/poses_pred.csv",
+                          'GAUSSIAN_OBJECT' : "data/ALGO_poses_result/{}/{}/camera_poses.csv"}
+    method_output_names = {'COLMAP' : "colmap",
+                           'CF3DGS' : "colmap_free3dgs",
+                           'GAUSSIAN_OBJECT' : "gaussian_object"}
 
-    fix_camera_orientation(blender_poses)
-    fix_camera_orientation(ground_truth_poses_blender)
+    for method, input_file in method_poses_files.items():
+        print(f"{method}")
+        eval_metrics[method] = {'ate':[],'rpe_trans':[],'rpe_rot':[]}
+        for object_folder in object_folders:
 
-    ground_truth_poses_blender = {key: ground_truth_poses_blender[key] for key in sorted(ground_truth_poses_blender)}
-    blender_poses = {key: blender_poses[key] for key in sorted(blender_poses)}
-    scale_align_method_poses(blender_poses, ground_truth_poses_blender)
-    blender_comparison = compare_camera_poses(ground_truth_poses_blender, blender_poses)
-    blender_comparison.to_csv(f'{outputFolder_blender}/blender_comparison.csv', index=False)
+            # Input files
+            method_path = input_file.format(method, object_folder)
+            ground_truth_path = f'data/poses_output/{object_folder}/ground_truth_camera_poses.csv'
 
-    data_folders = ['AP13', 'MDF14', 'ShSu12', 'SMu1']
-    # data_folders = ['test_rotation']
-    for folder in data_folders:
-        ground_truth_path = f'data/poses_output/{folder}/ground_truth_camera_poses.csv'
-        colmap_path = f'data/ALGO_poses_result/COLMAP/{folder}/camera_positions.csv'
-        colmap_free3dgs_path = f'data/ALGO_poses_result/CF3DGS/HO3Dv3_{folder}/poses_pred.csv'
-        gaussian_object_path = f'data/ALGO_poses_result/GAUSSIAN_OBJECT/{folder}/camera_poses.csv'
+            # Load pose
+            ground_truth_poses = load_camera_poses(ground_truth_path, 'Image ID', 'Camera Pose', normalize_image_id)
+            if(method == "CF3DGS"):
+                method_poses = load_camera_poses(method_path, 'Image ID', 'Camera Pose', normalize_image_id, multi_column=True)
+            else:
+                method_poses = load_camera_poses(method_path, 'Image Name', 'Camera Pose', normalize_image_id)
 
-        outputFolder = f'visualization/pose_data_comparation/{folder}/'
-        os.makedirs(outputFolder, exist_ok=True)
+            if(method == "GAUSSIAN_OBJECT"):
+                invert_matrices(method_poses)
 
-        ground_truth_poses = load_camera_poses(ground_truth_path, 'Image ID', 'Camera Pose', normalize_image_id)
-        colmap_poses = load_camera_poses(colmap_path, 'Image Name', 'Camera Pose', normalize_image_id)
-        colmap_free3dgs_poses = load_camera_poses(colmap_free3dgs_path, 'Image ID', 'Camera Pose', normalize_image_id, multi_column=True)
-        #invert_matrices(colmap_free3dgs_poses)
-        #transpose_rotations(colmap_free3dgs_poses)
-        #fix_camera_orientation(colmap_free3dgs_poses)
-        #convert_translations(colmap_free3dgs_poses)
-        gaussian_object_poses = load_camera_poses(gaussian_object_path, 'Image Name', 'Camera Pose', normalize_image_id)
-        invert_matrices(gaussian_object_poses)
+            # Filter each dictionary
+            common_ids = set(method_poses.keys()) & set(ground_truth_poses.keys())
+            gt_filtered = {img_id: copy.deepcopy(ground_truth_poses[img_id]) for img_id in common_ids}
+            method_poses = {img_id: copy.deepcopy(method_poses[img_id]) for img_id in common_ids}
 
+            # Sort
+            gt_filtered = {key: gt_filtered[key] for key in sorted(gt_filtered)}
+            method_poses = {key: method_poses[key] for key in sorted(method_poses)}
 
-        common_ids_colmap = set(colmap_poses.keys()) & set(ground_truth_poses.keys())
-        common_ids_cf3dgs = set(colmap_free3dgs_poses.keys()) & set(ground_truth_poses.keys())
-        common_ids_go = set(gaussian_object_poses.keys()) & set(ground_truth_poses.keys())
+            # Normalize & align
+            method_poses_ = method_poses.copy()
+            scale_align_method_poses(method_poses_)
+            scale_align_method_poses(method_poses, gt_filtered)
 
-        # Filter each dictionary
-        gt_filtered_colmap = {img_id: copy.deepcopy(ground_truth_poses[img_id]) for img_id in common_ids_colmap}
-        gt_filtered_cf3dgs = {img_id: copy.deepcopy(ground_truth_poses[img_id]) for img_id in common_ids_cf3dgs}
-        gt_filtered_go = {img_id: copy.deepcopy(ground_truth_poses[img_id]) for img_id in common_ids_go}
+            # Compare
+            method_, _ = compare_camera_poses(method_poses_, method_poses_)
+            method_comp, eval_point = compare_camera_poses(gt_filtered, method_poses)
 
-        colmap_poses = {img_id: copy.deepcopy(colmap_poses[img_id]) for img_id in common_ids_colmap}
-        colmap_free3dgs_poses = {img_id: copy.deepcopy(colmap_free3dgs_poses[img_id]) for img_id in common_ids_cf3dgs}
-        gaussian_object_poses = {img_id: copy.deepcopy(gaussian_object_poses[img_id]) for img_id in common_ids_go}
+            eval_metrics[method]['ate'].append(eval_point['ate'])
+            eval_metrics[method]['rpe_trans'].append(eval_point['rpe_trans'])
+            eval_metrics[method]['rpe_rot'].append(eval_point['rpe_rot'])
 
-        # Sort
-        gt_filtered_colmap = {key: gt_filtered_colmap[key] for key in sorted(gt_filtered_colmap)}
-        gt_filtered_cf3dgs = {key: gt_filtered_cf3dgs[key] for key in sorted(gt_filtered_cf3dgs)}
-        gt_filtered_go = {key: gt_filtered_go[key] for key in sorted(gt_filtered_go)}
-        colmap_poses = {key: colmap_poses[key] for key in sorted(colmap_poses)}
-        colmap_free3dgs_poses = {key: colmap_free3dgs_poses[key] for key in sorted(colmap_free3dgs_poses)}
-        gaussian_object_poses = {key: gaussian_object_poses[key] for key in sorted(gaussian_object_poses)}
+            # Output Results
+            outputFolder = f'visualization/pose_data_comparation/{object_folder}/'
+            os.makedirs(outputFolder, exist_ok=True)
+            method_comp.to_csv(f'{outputFolder}/{method_output_names[method]}_comparison.csv', index=False)
+            method_.to_csv(f'{outputFolder}/{method_output_names[method]}_.csv', index=False)
 
-        colmap_poses_ = colmap_poses.copy()
-        colmap_free3dgs_poses_ = colmap_free3dgs_poses.copy()
-        gaussian_object_poses_ = gaussian_object_poses.copy()
-
-        # Invert
-
-        #colmap_poses, colmap_ground_truth = filter_and_align_poses(colmap_poses, ground_truth_poses, do_scale=True)
-        #colmap_free3dgs_poses, colmap_free3dgs_ground_truth = filter_and_align_poses(colmap_free3dgs_poses, ground_truth_poses, do_scale=True)
-        #gaussian_object_poses, gaussian_object_ground_truth = filter_and_align_poses(gaussian_object_poses, ground_truth_poses, do_scale=True)
-        #blender_poses, blender_ground_truth = filter_and_align_poses(blender_poses, ground_truth_poses_blender, do_scale=True)
-
-        print(f'Folder {folder}')
-        print(f'\tFolder colmap_poses')
-        scale_align_method_poses(colmap_poses_)
-        print(f'\tFolder colmap_free3dgs_poses')
-        scale_align_method_poses(colmap_free3dgs_poses_)
-        print(f'\tFolder gaussian_object_poses')
-        scale_align_method_poses(gaussian_object_poses_)
-        print(f'\tFolder ground_truth_poses')
-        scale_align_method_poses(ground_truth_poses)
-        print(f'\tFolder colmap_comp')
-        scale_align_method_poses(colmap_poses, gt_filtered_colmap)
-        print(f'\tFolder colmap_free_comp')
-        scale_align_method_poses(colmap_free3dgs_poses, gt_filtered_cf3dgs)
-        print(f'\tFolder gaussian_object_comp')
-        scale_align_method_poses(gaussian_object_poses, gt_filtered_go)
-
-        colmap_ = compare_camera_poses(colmap_poses, colmap_poses)
-        colmap_free3dgs_ = compare_camera_poses(colmap_free3dgs_poses, colmap_free3dgs_poses)
-        gaussian_object_ = compare_camera_poses(gaussian_object_poses, gaussian_object_poses)
-        ground_truth_ = compare_camera_poses(ground_truth_poses, ground_truth_poses)
-
-        colmap_comparison = compare_camera_poses(gt_filtered_colmap, colmap_poses)
-        colmap_free3dgs_comparison = compare_camera_poses(gt_filtered_cf3dgs, colmap_free3dgs_poses)
-        gaussian_object_comparison = compare_camera_poses(gt_filtered_go, gaussian_object_poses)
-
-        colmap_comparison.to_csv(f'{outputFolder}/colmap_comparison.csv', index=False)
-        colmap_free3dgs_comparison.to_csv(f'{outputFolder}/colmap_free3dgs_comparison.csv', index=False)
-        gaussian_object_comparison.to_csv(f'{outputFolder}/gaussian_object_comparison.csv', index=False)
-
-        colmap_.to_csv(f'{outputFolder}/colmap_.csv', index=False)
-        colmap_free3dgs_.to_csv(f'{outputFolder}/colmap_free3dgs_.csv', index=False)
-        gaussian_object_.to_csv(f'{outputFolder}/gaussian_object_.csv', index=False)
-        ground_truth_.to_csv(f'{outputFolder}/ground_truth_.csv', index=False)
+        outline = f"\t\tAverage Results ATE = {np.average(eval_metrics[method]['ate'])}, "
+        outline += f"RPE_trans = {np.average(eval_metrics[method]['rpe_trans'])}, "
+        outline += f"RPE_rot = {np.average(eval_metrics[method]['rpe_rot'])}"
+        print(outline)
 
 if __name__ == "__main__":
     main()
